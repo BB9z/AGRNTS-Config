@@ -1,0 +1,5 @@
+.backup/
+.state/
+__pycache__
+tmp/
+.DS_Store

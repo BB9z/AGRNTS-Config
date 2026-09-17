@@ -1,0 +1,125 @@
+{
+  "agentPushNotifEnabled": false,
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "autoCompactEnabled": false,
+  "autoUpdatesChannel": "stable",
+  "editorMode": "normal",
+  "effortLevel": "high",
+  "enabledPlugins": {
+    "typescript-lsp@claude-plugins-official": true
+  },
+  "env": {
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
+    "CLAUDE_CODE_EFFORT_LEVEL": "auto",
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_FEEDBACK_COMMAND": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DO_NOT_TRACK": "1",
+    "ENABLE_LSP_TOOL": "1"
+  },
+  "extraKnownMarketplaces": {
+    "claude-plugins-official": {
+      "source": {
+        "repo": "anthropics/claude-plugins-official",
+        "source": "github"
+      }
+    }
+  },
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "say '请求授权'"
+          },
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk hook claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.last_assistant_message // \"完成了\"' | head -c 40 | say",
+            "timeout": 10
+          },
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "inputNeededNotifEnabled": true,
+  "permissions": {
+    "allow": [
+      "Bash(./scripts/ci-test.sh:*)",
+      "Bash(brew:*)",
+      "Bash(find:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh repo view:*)",
+      "Bash(git:*)",
+      "Bash(grep:*)",
+      "Bash(ln -s:*)",
+      "Bash(ls:*)",
+      "Bash(npx tsx:*)",
+      "Bash(pnpm *)",
+      "Bash(source .env)",
+      "Bash(uv run *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(tail -3 /tmp_check.log)",
+      "Bash(rm -f /tmp_check.log)",
+      "Bash(grep ABORT /tmp_out.log)",
+      "Bash(rm -f /tmp_out.log)",
+      "Bash(rmdir tmp/f1check_tamper tmp/f1check_tamper2)"
+    ],
+    "defaultMode": "default",
+    "deny": [],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git pr create *)"
+    ],
+    "additionalDirectories": []
+  },
+  "preferredNotifChannel": "auto",
+  "remoteControlAtStartup": false,
+  "teammateMode": "auto",
+  "cleanupPeriodDays": 90,
+  "switchModelsOnFlag": true,
+  "model": "opus[1m]"
+}
