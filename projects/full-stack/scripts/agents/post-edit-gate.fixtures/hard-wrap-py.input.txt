@@ -1,0 +1,3 @@
+# This helper computes the running total across every batch that the nightly ingest job processed
+# because downstream reporting needs one number instead of the raw per-batch counts it started with
+count = 1

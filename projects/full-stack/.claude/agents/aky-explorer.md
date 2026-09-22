@@ -28,10 +28,10 @@ Bad: `to-typst#toTypst — no production caller in src/; PDF export has no wired
 ## Flow
 
 1. Read both index files; plan from them + the query.
-2. Dispatch readers synchronously (`run_in_background: false`) — never background. Parallelize independent ones, but block until all return; never end while a reader runs.
+2. Call readers with `run_in_background: false, model: haiku`. Parallelize independent ones, but never return to the caller until all tasks have completed.
 3. Judge the reports. A miss may be drift or a bad guess, not proof the target is gone — readers report clues (e.g. "imports from X") and never expand scope; you decide the next hop.
 4. Update the local index if the search cleared the admission bar. After any edit to either index file, run `node scripts/agents/code-index-lint.mjs` and fix whatever it reports before moving on.
-5. Return the answer. Your final output must BE the answer, never a status line.
+5. Return the answer. Your final output must BE the answer, never a status line. No progress reports before it.
 
 ## Readers
 

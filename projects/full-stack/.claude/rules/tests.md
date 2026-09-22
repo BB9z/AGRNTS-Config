@@ -22,3 +22,9 @@ Too loose (existence-only checks like `toBeDefined`, `.length > 0`) and too tigh
 - Strengthen an existing test before adding a parallel one.
 - Add a test only for a real, uncovered branch — never for coverage's sake.
 - Delete a test that catches nothing others don't. But check whether it's the sole guardian of a specific behavior — if so, move it to the right place instead of dropping it.
+
+## Test tiers
+
+- Unit (`test`): no network, no database; runs in CI.
+- Integration (`test:integration`): local database and Redis only, never a real external service.
+- Manual (`test:manual`): anything that calls a real external service (Azure, S3). Lives in `tests/manual` with its own vitest config and never runs in CI or as part of `test` / `test:integration`.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""配置同步工具：把模板仓（本仓库）的内容同步到目标仓，并把目标仓的改动带回来。
+"""Config sync tool: syncs this template repo's content into target repos and brings target-side edits back.
 
-用法见 --help。设计背景见 docs/config-sync.decision.md。
+See --help for usage and docs/config-sync.decision.md for the design background.
 """
 
 from __future__ import annotations
@@ -18,35 +18,51 @@ from datetime import datetime
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECTS_ROOT = os.path.join(REPO_ROOT, "projects")
+# Single source for files shared by project templates, which link to them; project-level pullbacks write through those links.
+SHARED_ROOT = os.path.join(REPO_ROOT, "shared")
 STATE_ROOT = os.path.join(REPO_ROOT, ".state")
 CONFIG_PATH = os.path.join(STATE_ROOT, "config.json")
 SNAPSHOT_ROOT = os.path.join(STATE_ROOT, "snapshots")
 BACKUP_ROOT = os.path.join(REPO_ROOT, ".backup")
 
-# 用户级同步：模板固定是 user/claude/，落盘固定是 ~/.claude/，用一个不会与数字短 ID 冲突的固定短 ID 存状态与备份。两个根都做成可替换的模块级常量，测试指向 tmp/ 下的临时目录，不碰真实的 ~/.claude/。
+# User level: fixed roots, and a short ID that can't collide with numeric ones.
 USER_TEMPLATE_ROOT = os.path.join(REPO_ROOT, "user", "claude")
 USER_TARGET_ROOT = os.path.expanduser("~/.claude")
 USER_SHORT_ID = "user"
 
-# scripts/sync_settings.py 是纯数据变换模块，不碰路径常量，独立出去不影响测试对上面这些常量的整体替换；这里保证无论 sync.py 是被直接执行还是被 importlib 按文件路径加载，都能找到同目录下的它。
+# Importable whether this file is run directly or loaded by path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sync_settings as jsonmerge  # noqa: E402
 
-# 不参与同步的相对路径：本机专属，不应该有通用版本可下发或回流。
+# Machine-local, so never synced.
 EXCLUDE_RELPATHS = frozenset({".claude/settings.local.json"})
-
-# 不参与同步的文件名：出现在哪一层都排除。系统与工具自动生成，跟配置无关，且两侧各自随时会再生，纳入同步只会制造无休止的改动。
-EXCLUDE_NAMES = frozenset({".DS_Store"})
 
 
 def is_excluded(relpath: str) -> bool:
-    return relpath in EXCLUDE_RELPATHS or any(
-        part in EXCLUDE_NAMES for part in relpath.split("/")
+    return relpath in EXCLUDE_RELPATHS
+
+
+def gitignored_relpaths(template_root: str, relpaths) -> set[str]:
+    """Relpaths ignored by the template repo's .gitignore. Runs from REPO_ROOT because template_root may not exist."""
+    rels = list(relpaths)
+    if not rels:
+        return set()
+    prefix = os.path.relpath(template_root, REPO_ROOT)
+    args = [rel if prefix == "." else f"{prefix}/{rel}" for rel in rels]
+    proc = subprocess.run(
+        ["git", "check-ignore", *args],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
     )
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(f"git check-ignore failed: {proc.stderr}")
+    ignored = set(proc.stdout.splitlines())
+    return {rel for rel, arg in zip(rels, args) if arg in ignored}
 
 
 def atomic_write_bytes(path: str, data: bytes, executable: bool) -> None:
-    """把 data 原子写入 path：先写临时文件再 rename，中途崩溃不留半截文件。"""
+    """Write data to path atomically via a temp file and rename, so a crash never leaves a half-written file."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".sync-tmp-", dir=directory)
@@ -69,10 +85,7 @@ def snapshot_dir(short_id: str, side: str) -> str:
 
 
 def read_state(root: str, relpath: str):
-    """读 root 下 relpath 的当前内容与可执行位。文件缺席（本身不存在，或路径中间某段不是目录）时返回 None；其它 I/O 错误（权限不足等）原样抛出——那不是「缺席」，不能被判定当成删除传播到另一侧，应该中止本次同步。
-
-    始终按 open()/os.stat() 的默认行为跟随符号链接，这样模板仓、目标仓、快照区三类根目录可以复用同一份读取逻辑。
-    """
+    """Return (content, executable) of relpath under root, following symlinks, or None if absent. Other I/O errors propagate: treating them as absence would propagate a deletion."""
     path = os.path.join(root, *relpath.split("/"))
     try:
         st = os.stat(path)
@@ -89,19 +102,25 @@ def read_state(root: str, relpath: str):
 
 
 class OutOfScope(Exception):
-    """写入解析到的真实路径落在本次同步范围之外时抛出。范围是模板侧那个模板目录、目标侧那个目标仓根——同步动作不允许溢出到不受管的地方。"""
+    """A write resolved to a real path outside the sync scope."""
+
+
+def _is_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
 
 
 def resolve_write_path(root: str, relpath: str) -> str:
-    """算出 relpath 真正应该落笔的路径：如果 relpath 本身或路径中间是符号链接，跟随到链接指向的真实位置，写入落在真实文件上而不是替换链接本身。真实位置若不在 root 之内，抛 OutOfScope。"""
+    """Real path a write to relpath lands on, following symlinks so the link itself is kept. Raises OutOfScope outside root, plus shared/ for project templates."""
     path = os.path.join(root, *relpath.split("/"))
     real = os.path.realpath(path)
     real_root = os.path.realpath(root)
-    try:
-        common = os.path.commonpath([real, real_root])
-    except ValueError:
-        common = None
-    if common != real_root:
+    scopes = [real_root]
+    if _is_within(real_root, os.path.realpath(PROJECTS_ROOT)):
+        scopes.append(os.path.realpath(SHARED_ROOT))
+    if not any(_is_within(real, scope) for scope in scopes):
         raise OutOfScope(real)
     return real
 
@@ -113,7 +132,7 @@ def write_state(root: str, relpath: str, state) -> None:
 
 
 def remove_state(root: str, relpath: str) -> None:
-    """删除只删 relpath 这个路径本身（符号链接就删链接，不跟随），再顺手清理因此变空的父目录，但绝不越过 root 边界——用规范化路径的 commonpath 判断父目录是否仍在 root 之内，而不是对字符串做 startswith。"""
+    """Delete relpath without following symlinks, then prune emptied parents up to root."""
     path = os.path.join(root, *relpath.split("/"))
     try:
         os.remove(path)
@@ -139,11 +158,9 @@ def remove_state(root: str, relpath: str) -> None:
 
 
 def scan_tree(root: str):
-    """列出 root 下所有文件的相对路径（白名单式，目录不是同步单位）。
+    """List file relpaths under root, following symlinks; broken and circular links go into issues.
 
-    符号链接一律跟随：文件链接直接记为普通文件（读写走目标真实内容）；目录链接跟随展开，用真实路径做祖先集合防止循环。断链与循环记入 issues，不计入 files。
-
-    出错处理与 read_state 同一条准则：只有「这里没有东西」才当缺席跳过，权限不足一类真正的 I/O 错误原样抛出中止本次同步。扫描结果就是模板侧的白名单，静默少扫一批文件等同于宣告它们已被删除，会把删除传播到另一侧。
+    Only absence is skipped. Other I/O errors propagate, since files missed by a partial scan would read as deletions.
     """
     files: dict[str, bool] = {}
     issues: list[tuple[str, str]] = []
@@ -152,7 +169,7 @@ def scan_tree(root: str):
         try:
             entries = list(os.scandir(dir_path))
         except (FileNotFoundError, NotADirectoryError):
-            # 根目录不存在是合法的空树；子目录走到这里说明扫描期间它被挪走了，这一枝确实已经没有内容。
+            # A missing root is an empty tree; a missing subdirectory was moved away mid-scan.
             return
         for entry in sorted(entries, key=lambda e: e.name):
             rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
@@ -167,7 +184,7 @@ def scan_tree(root: str):
                     issues.append((rel, "broken"))
                     continue
                 except OSError as e:
-                    # 自成环的链接在 stat 这一步就失败，走不到下面的祖先集合判定。
+                    # A self-referencing link fails here, before the ancestry check.
                     if e.errno != errno.ELOOP:
                         raise
                     issues.append((rel, "circular"))
@@ -196,7 +213,7 @@ def scan_tree(root: str):
 
 
 def list_snapshot_relpaths(short_id: str) -> set[str]:
-    """两侧快照树的路径集合取并集，不假设它们恒等——一侧缺席、一侧仍有快照的情况在本批次开始出现（比如合并被挂起后用户手工删掉了某一侧）。"""
+    """Union of both snapshot trees, which can diverge, e.g. when one side is deleted by hand during a hold."""
     relpaths: set[str] = set()
     for side in ("template", "target"):
         base = snapshot_dir(short_id, side)
@@ -209,22 +226,16 @@ def list_snapshot_relpaths(short_id: str) -> set[str]:
 
 
 def decide(t, l, ts, ls, has_snapshot: bool) -> str:
-    """三方判定表：只看内容与可执行位，不看 mtime。
+    """Three-way decision on content and executable bit, never mtime. t/l are the current template/target states, ts/ls their snapshots; None means absent.
 
-    t/l 是模板侧、目标侧现在的状态；ts/ls 是快照对里记录的对应状态； None 表示文件缺席，缺席也是内容的一种，参与同一张表。
-
-    两侧快照允许不等，差异就是已知定制。只要存在这种定制（ts != ls），哪怕这一轮只有一侧偏离了自己的快照，也不能直接把内容送到对侧——那会把定制覆盖掉。
-
-    改成走合并：合并以两侧各自的快照为交叉 base（在 apply_needs_merge 里实现），current 与 base 相等时 diff3 的结果就是 other，效果和直送完全一样，所以两侧快照相等时走合并没有区别，直送只是为了清单可读性保留的快速路径，不是另一套语义。
-
-    删除不受这条规则影响：模板删除即使目标侧有定制也直接删，目标删除同理直接从模板摘掉，删除是明确动作，没有「合并」的余地。
+    Differing snapshots are a known customization, so a one-sided change then goes through a merge instead of overwriting the other side. Deletions always propagate directly.
     """
     if not has_snapshot:
         if t is not None and l is None:
             return "push"
         if t is not None and l is not None:
             return "first_adopt"
-        # t is None：模板没有也没快照，若还出现在 universe 里说明只在目标仓存在，属于目标仓自有文件，不应参与判定；防御性地当无动作处理。
+        # Only in the target: the target repo's own file.
         return "none"
 
     t_changed = t != ts
@@ -232,7 +243,7 @@ def decide(t, l, ts, ls, has_snapshot: bool) -> str:
     if not t_changed and not l_changed:
         return "none"
     if t is None and l is None:
-        # 两侧都缺席：都被删了，没有内容可比较，也没有理由继续报「需要合并」——那样只会一次又一次重复同一条、永远收敛不了。直接清快照、记无动作。
+        # Nothing left to compare; clearing the snapshot lets it converge.
         return "both_deleted"
 
     customized = ts != ls
@@ -249,19 +260,17 @@ def decide(t, l, ts, ls, has_snapshot: bool) -> str:
 
 def collect_universe(short_id: str, template_root: str):
     template_files, issues = scan_tree(template_root)
-    # 快照里可能留着排除规则生效之前存下的路径，一并按现行规则过滤，免得它们继续被判定、被传播。
-    universe = {
+    # Snapshots may hold paths saved before an exclusion rule existed.
+    candidates = {
         rel for rel in set(template_files) | list_snapshot_relpaths(short_id)
         if not is_excluded(rel)
     }
+    universe = candidates - gitignored_relpaths(template_root, candidates)
     return universe, issues
 
 
 def plan_sync(short_id: str, template_root: str, target_root: str):
-    """扫描 + 判定，返回该目标每个受关注文件的动作，不做任何写入。
-
-    项目级、用户级共用这一份：调用方直接给模板根与落盘根，不再要求一个「登记记录」的形状，用户级同步没有配置记录也能走同一条路径。
-    """
+    """Decide each file's action without writing anything."""
     universe, issues = collect_universe(short_id, template_root)
 
     actions = []
@@ -278,52 +287,65 @@ def plan_sync(short_id: str, template_root: str, target_root: str):
     return actions, issues
 
 
-ACTION_LABELS = {
-    "push": "下发",
-    "pullback": "回流",
-    "delete_target": "删除-目标仓",
-    "delete_template": "删除-模板仓",
-    "both_deleted": "两侧均已删除",
-    "first_adopt": "首次接管",
-    "needs_merge": "需要合并",
+NEEDS_REVIEW = "NEEDS REVIEW"
+
+# Report line per file: (label, note), keyed by action, outcome, or scan issue; "{repo}" is the target's display name.
+REPORT_LINES = {
+    "push": ("template → {repo}", ""),
+    "first_adopt": ("template → {repo}", "first sync, {repo} version replaced"),
+    "pullback": ("{repo} → template", ""),
+    "delete_target": ("removed from {repo}", "deleted in template"),
+    "delete_template": ("removed from template", "deleted in {repo}"),
+    "needs_merge": ("will merge", ""),
+    "merged_clean": ("merged", ""),
+    "merged_conflict": (NEEDS_REVIEW, "conflict markers in both files"),
+    "skip_absent": (NEEDS_REVIEW, "deleted on one side, edited on the other"),
+    "skip_binary": (NEEDS_REVIEW, "binary file changed on both sides"),
+    "settings_merged_clean": ("merged", ""),
+    "settings_merged_conflict": (NEEDS_REVIEW, "conflicting keys"),
+    "settings_invalid_json": (NEEDS_REVIEW, "invalid JSON"),
+    "out_of_scope": ("skipped", "symlink points outside the template or {repo}"),
+    "broken": ("skipped", "broken symlink"),
+    "circular": ("skipped", "symlink loop"),
 }
 
-MERGE_OUTCOME_LABELS = {
-    "merged_clean": "合并-干净",
-    "merged_conflict": "合并-冲突，已挂起",
-    "skip_absent": "合并-跳过（一侧缺席），已挂起",
-    "skip_binary": "合并-跳过（非文本），已挂起",
-    "skipped_out_of_scope": "合并-跳过（链接超出范围）",
-    "settings_merged_clean": "键级合并-干净",
-    "settings_merged_conflict": "键级合并-冲突，已挂起",
-    "settings_invalid_json": "键级合并-跳过（无法解析），已挂起",
-}
-
-ISSUE_LABELS = {
-    "broken": "断链",
-    "circular": "循环链接",
-    "out_of_scope": "链接目标超出同步范围",
-}
+# Not worth reporting: both sides deleted only clears a snapshot.
+_SILENT_ACTIONS = ("none", "both_deleted")
 
 
-def print_report(actions, issues) -> None:
-    changed = [a for a in actions if a["action"] != "none"]
-    for a in changed:
-        label = MERGE_OUTCOME_LABELS[a["merge_outcome"]] if "merge_outcome" in a else ACTION_LABELS[a["action"]]
-        notes = []
-        if a.get("exec_conflict"):
-            notes.append("可执行位冲突，已保留各侧现值")
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def print_report(actions, issues, repo_name: str) -> None:
+    lines = []
+    for a in actions:
+        if a["action"] in _SILENT_ACTIONS:
+            continue
+        label, note = REPORT_LINES[a.get("outcome", a["action"])]
+        notes = [note] if note else []
         if a.get("settings_conflict_paths"):
-            notes.append("冲突键：" + ", ".join(a["settings_conflict_paths"]))
-        note = f"（{'；'.join(notes)}）" if notes else ""
-        print(f"[{label}] {a['relpath']}{note}")
+            notes[-1] += ": " + ", ".join(a["settings_conflict_paths"])
+        if a.get("exec_conflict"):
+            notes.append("executable bit differs, each side kept as is")
+        lines.append((label, a["relpath"], "; ".join(notes)))
     for rel, reason in issues:
-        print(f"[{ISSUE_LABELS[reason]}，跳过] {rel}")
-    print(f"共 {len(changed)} 个文件有动作，{len(issues)} 个链接问题被跳过")
+        label, note = REPORT_LINES[reason]
+        lines.append((label, rel, note))
+
+    lines = [(label.format(repo=repo_name), rel, note.format(repo=repo_name)) for label, rel, note in lines]
+    width = max((len(label) for label, _, _ in lines), default=0)
+    for label, rel, note in lines:
+        print(f"  {label:<{width}}  {rel}" + (f"  ({note})" if note else ""))
+
+    skipped = sum(1 for label, _, _ in lines if label == "skipped")
+    review = sum(1 for label, _, _ in lines if label == NEEDS_REVIEW)
+    changed = len(lines) - skipped - review
+    print(f"{changed} changed, {review} need review, {skipped} skipped.")
 
 
 def backup_before_overwrite(batch_dir: str, short_id: str, side: str, relpath: str, current_state) -> None:
-    """把即将被覆盖或删除的原内容备份到本次同步批次目录下。current_state 为 None（原本就不存在）时无需备份。"""
+    """Back up content about to be overwritten or deleted into this batch's directory."""
     if current_state is None:
         return
     data, executable = current_state
@@ -331,17 +353,20 @@ def backup_before_overwrite(batch_dir: str, short_id: str, side: str, relpath: s
     atomic_write_bytes(backup_path, data, executable)
 
 
-def apply_write(batch_dir, short_id, side, root, relpath, current_state, new_state, issues) -> bool:
-    """把 new_state 写进 root/relpath。写入目标解析到同步范围之外（穿透符号链接后落在别处）时不写，往 issues 里记一条，返回 False 让调用方据此跳过这个文件的快照更新——不然下次同步就再也发现不了这处遗留改动。"""
-    if current_state == new_state:
-        return True
-    try:
-        resolve_write_path(root, relpath)
-    except OutOfScope:
-        issues.append((relpath, "out_of_scope"))
-        return False
-    backup_before_overwrite(batch_dir, short_id, side, relpath, current_state)
-    write_state(root, relpath, new_state)
+def apply_writes(batch_dir, short_id, relpath, writes) -> bool:
+    """Write each side's new state, skipping unchanged sides. writes is [(side, root, current, new)].
+
+    If any side resolves outside the sync scope, nothing is written, so a merge never lands on one side only; returns False so the caller leaves the snapshot alone and the change is reported again.
+    """
+    changed = [(side, root, cur, new) for side, root, cur, new in writes if cur != new]
+    for _side, root, _cur, _new in changed:
+        try:
+            resolve_write_path(root, relpath)
+        except OutOfScope:
+            return False
+    for side, root, cur, new in changed:
+        backup_before_overwrite(batch_dir, short_id, side, relpath, cur)
+        write_state(root, relpath, new)
     return True
 
 
@@ -358,7 +383,7 @@ def clear_snapshot_pair(short_id: str, relpath: str) -> None:
 
 
 def save_one_snapshot(root: str, relpath: str, state) -> None:
-    """state 为 None（该侧此刻缺席）时清掉这一侧的快照文件，而不是把 None 往下传给期待 (data, executable) 二元组的 write_state。"""
+    """A None state removes the snapshot file."""
     if state is None:
         remove_state(root, relpath)
     else:
@@ -366,7 +391,7 @@ def save_one_snapshot(root: str, relpath: str, state) -> None:
 
 
 def save_snapshot_pair(short_id: str, template_root: str, target_root: str, relpath: str) -> None:
-    """快照永远存两侧此刻的实际内容，不凭动作类型推断——这样首次接管、下发、回流、合并都不需要各自记一套快照写入逻辑。调用时机同样要紧：必须在用户确认（挂起交互的那一次回车）之后才读，读早了会把「撤销即登记」这条语义打掉。"""
+    """Snapshot what both sides contain right now."""
     t = read_state(template_root, relpath)
     l = read_state(target_root, relpath)
     save_one_snapshot(snapshot_dir(short_id, "template"), relpath, t)
@@ -381,7 +406,7 @@ _CONFLICT_MARKER_PREFIXES = (b"<<<<<<<", b">>>>>>>")
 
 
 def has_conflict_markers(data: bytes) -> bool:
-    """检查内容里是否还留着 git 冲突标记行。回车确认之后要不要落快照，看的就是这个客观事实，不是猜用户到底有没有动手改。"""
+    """Whether git conflict marker lines remain."""
     for line in data.split(b"\n"):
         if line.startswith(_CONFLICT_MARKER_PREFIXES[0]) or line.startswith(_CONFLICT_MARKER_PREFIXES[1]):
             return True
@@ -389,7 +414,7 @@ def has_conflict_markers(data: bytes) -> bool:
 
 
 def merge_bool_3way(base: bool, current: bool, other: bool) -> tuple[bool, bool]:
-    """可执行位的三方判定，形状和内容合并一样：只有一侧变了就用变了的那个值；两侧都变但变成同一个值也没有冲突；两侧都变且不同，保留 current（本侧现值），第二个返回值告诉调用方这是一次冲突，需要在清单里标注。"""
+    """Three-way merge of the executable bit. On a real conflict keeps current and returns True as the second value."""
     if current == other:
         return current, False
     if current == base:
@@ -400,10 +425,7 @@ def merge_bool_3way(base: bool, current: bool, other: bool) -> tuple[bool, bool]
 
 
 def git_merge_file(current: bytes, base: bytes, other: bytes, labels: tuple[str, str, str]) -> tuple[bytes, int]:
-    """用 git merge-file -p 做一次三方合并，三个输入各写一个临时文件（放在系统临时目录，不进模板仓也不进目标仓），结果从 stdout 拿到。
-
-    返回 (合并后内容, 冲突数)：0 表示干净合并，正数是冲突段数，git 本身出错时返回码是负数，这里转成异常让调用方中止而不是当作「有冲突」处理。
-    """
+    """Three-way merge via git merge-file -p. Returns (content, conflict count); raises if git itself fails."""
     with tempfile.TemporaryDirectory(prefix="agent-config-sync-merge-") as d:
         current_path = os.path.join(d, "current")
         base_path = os.path.join(d, "base")
@@ -424,20 +446,17 @@ def git_merge_file(current: bytes, base: bytes, other: bytes, labels: tuple[str,
         )
         if proc.returncode < 0:
             raise RuntimeError(
-                f"git merge-file 出错：{proc.stderr.decode('utf-8', 'replace')}"
+                f"git merge-file failed: {proc.stderr.decode('utf-8', 'replace')}"
             )
         return proc.stdout, proc.returncode
 
 
-def apply_needs_merge(batch_dir, short_id, template_root, target_root, a: dict, issues: list):
-    """处理判定表里「需要合并」的一格：可能是两侧都偏离了快照，也可能只有一侧偏离但两侧快照本就不等（已有定制）。
+def apply_needs_merge(batch_dir, short_id, template_root, target_root, a: dict):
+    """Merge a file changed on both sides, or changed on one side while customized.
 
-    三方合并是把 other 相对 base 的变化应用到 current，所以 base 必须取「变化来源那一侧」的快照，两次合并各用对侧快照、互不干扰：
-    - 目标侧结果：current=目标现内容，base=模板快照，other=模板现内容
-    - 模板侧结果：current=模板现内容，base=目标快照，other=目标现内容
-    取本侧快照当 base 是错的——那会把「两侧快照本来就不同」这个已知定制本身也当成一处要合并的变化，合并结果就把定制抹掉了。
+    Each side takes the other's change with the other side's snapshot as base. Using its own snapshot as base would count the customization itself as a change and erase it.
 
-    返回 (outcome, exec_conflict, 需要打开编辑器看的路径列表)。两种情况不合并、两侧都不动，直接进挂起：一侧缺席（空文件当一方合并没有意义）、非文本文件（合并只会产出无意义的冲突标记）。
+    Returns (outcome, exec_conflict, paths to open). Files absent on one side or non-text are held without merging.
     """
     rel = a["relpath"]
     t, l, ts, ls = a["t"], a["l"], a["ts"], a["ls"]
@@ -458,22 +477,21 @@ def apply_needs_merge(batch_dir, short_id, template_root, target_root, a: dict, 
 
     target_merged, target_conflicts = git_merge_file(
         current=l_data, base=ts_data, other=t_data,
-        labels=("目标仓", "模板仓快照", "模板仓"),
+        labels=("repo", "template (last sync)", "template"),
     )
     template_merged, template_conflicts = git_merge_file(
         current=t_data, base=ls_data, other=l_data,
-        labels=("模板仓", "目标仓快照", "目标仓"),
+        labels=("template", "repo (last sync)", "repo"),
     )
     target_exec, target_exec_conflict = merge_bool_3way(ts_exec, l_exec, t_exec)
     template_exec, template_exec_conflict = merge_bool_3way(ls_exec, t_exec, l_exec)
 
-    target_ok = apply_write(batch_dir, short_id, "target", target_root, rel, l, (target_merged, target_exec), issues)
-    template_ok = apply_write(
-        batch_dir, short_id, "template", template_root, rel, t, (template_merged, template_exec), issues
-    )
-    if not (target_ok and template_ok):
-        # 某一侧的写入穿透符号链接后落到范围外被拦下：整份都不算完成，留给下次重跑，快照也不更新，免得把这处未完成的改动悄悄吞掉。
-        return "skipped_out_of_scope", False, []
+    writes = [
+        ("target", target_root, l, (target_merged, target_exec)),
+        ("template", template_root, t, (template_merged, template_exec)),
+    ]
+    if not apply_writes(batch_dir, short_id, rel, writes):
+        return "out_of_scope", False, []
 
     conflicted = target_conflicts != 0 or template_conflicts != 0
     editor_paths = [template_path, target_path] if conflicted else []
@@ -489,7 +507,7 @@ _SETTINGS_INVALID = object()
 
 
 def _load_json_side(state):
-    """state 是 read_state() 的返回值。文件整份缺席时当作空对象——键级判定会让每条托管叶子自然表现为「待下发」或「待接管」，不需要特殊分支。解析失败（不是合法 JSON，或顶层不是对象）返回 _SETTINGS_INVALID，让调用方整体退回「跳过、挂起」，不去猜半份坏文件里哪些键还能信。"""
+    """Parse a settings.json state; absent counts as {}. Returns _SETTINGS_INVALID unless it's a JSON object, so a broken file is held rather than partially trusted."""
     if state is None:
         return {}
     try:
@@ -499,14 +517,10 @@ def _load_json_side(state):
     return obj if isinstance(obj, dict) else _SETTINGS_INVALID
 
 
-def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dict, issues: list):
-    """settings.json 的键级合并：对象逐层展开，数组与标量是叶子；托管集合是模板当前或模板快照里出现过的叶子路径，目标仓自己独有的路径完全不看。
+def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dict):
+    """Key-level merge of settings.json. Managed leaves are those in the template or its snapshot; target-only keys are left alone. Each leaf goes through decide(). A conflicting leaf keeps each side's value and is reported, since conflict markers would break the JSON.
 
-    每条叶子套用整文件那套三方判定表（decide()），字符串数组按集合合并。
-
-    其余类型的叶子在两侧都变且值不同时没有可靠的合并方式，保留各自现值、点名报告为冲突，交给用户在挂起环节里手工协调——不写冲突标记进 JSON，那会让文件直接无法解析。
-
-    返回契约与 apply_needs_merge 一致：(outcome, exec_conflict, 挂起路径)。
+    Same return contract as apply_needs_merge.
     """
     rel = a["relpath"]
     t, l, ts, ls = a["t"], a["l"], a["ts"], a["ls"]
@@ -538,7 +552,7 @@ def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dic
         if outcome in ("push", "first_adopt"):
             target_leaves[path] = tv
         elif outcome == "pullback":
-            # 目标侧已经是源头，target_leaves 里本来就是 lv；模板侧要接住这个新值，不然目标仓对托管键的修改永远回流不到模板仓。
+            # target_leaves already holds lv; the template takes it too.
             template_leaves[path] = lv
         elif outcome == "delete_target":
             target_leaves.pop(path, None)
@@ -569,14 +583,12 @@ def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dic
     target_exec, target_exec_conflict = merge_bool_3way(ts_exec, l_exec, t_exec)
     template_exec, template_exec_conflict = merge_bool_3way(ls_exec, t_exec, l_exec)
 
-    target_ok = apply_write(
-        batch_dir, short_id, "target", target_root, rel, l, (new_target_bytes, target_exec), issues
-    )
-    template_ok = apply_write(
-        batch_dir, short_id, "template", template_root, rel, t, (new_template_bytes, template_exec), issues
-    )
-    if not (target_ok and template_ok):
-        return "skipped_out_of_scope", False, []
+    writes = [
+        ("target", target_root, l, (new_target_bytes, target_exec)),
+        ("template", template_root, t, (new_template_bytes, template_exec)),
+    ]
+    if not apply_writes(batch_dir, short_id, rel, writes):
+        return "out_of_scope", False, []
 
     exec_conflict = target_exec_conflict or template_exec_conflict
     if conflicted_paths:
@@ -585,10 +597,11 @@ def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dic
     return "settings_merged_clean", exec_conflict, []
 
 
-def wait_for_enter() -> bool:
-    """挂起交互里等用户处理完文件后按一次回车，返回值是「是否真的等到了一次人工确认」。stdin 不是交互终端（测试、脚本调用、无人值守跑批）时没有人来按回车，返回 False——调用方据此知道这次「确认」缺席，不能把它当成真的确认对待。"""
+def wait_for_enter(prompt: str) -> bool:
+    """Show prompt and wait for Enter. Without a terminal prints nothing and returns False, meaning nobody confirmed."""
     if not sys.stdin.isatty():
         return False
+    print(prompt)
     try:
         input()
     except EOFError:
@@ -597,28 +610,28 @@ def wait_for_enter() -> bool:
 
 
 def open_editor(paths: list[str]) -> None:
-    """用 $EDITOR 打开挂起文件，不等它退出——用户在挂起期间可以用任意方式改两侧文件，不必被绑定在这一个编辑器进程上。没设置 $EDITOR 时只打印提示，不阻塞。"""
+    """Open files in $EDITOR without waiting, so the user can edit either side by any means during the hold."""
     editor = os.environ.get("EDITOR")
     if not editor:
-        print("未设置 $EDITOR，请自行打开并处理以下文件：")
+        print("$EDITOR is not set; open these files yourself:")
         for p in paths:
             print(f"  {p}")
         return
     try:
         subprocess.Popen([editor, *paths])
     except OSError as e:
-        print(f"启动编辑器失败（{e}），请自行打开并处理以下文件：")
+        print(f"Couldn't start $EDITOR ({e}); open these files yourself:")
         for p in paths:
             print(f"  {p}")
 
 
-# 这几种结果工具其实什么都没写、或者写出来的内容本身还带着待处理的标记，只是挂起等用户处理，不能落快照——落了就等于把一个没解决的冲突静默登记成「已确认」，删除没传播、修改没传播，下次同步也不会再报了。
-_NEVER_SNAPSHOT_OUTCOMES = ("skip_absent", "skip_binary", "skipped_out_of_scope", "settings_invalid_json")
+# Nothing confirmable was written; snapshotting these would hide an unresolved change.
+_NEVER_SNAPSHOT_OUTCOMES = ("skip_absent", "skip_binary", "out_of_scope", "settings_invalid_json")
 _HOLD_OUTCOMES = ("merged_conflict", "settings_merged_conflict")
 
 
 def apply_force_override(actions: list, side: str) -> None:
-    """--force-template / --force-target 逃生舱：忽略快照与对侧改动，把每个文件的动作强改成朝一个方向的单向覆盖或删除。已经没有差异的条目不去动它，报告里不会平白多出一堆没意义的条目。"""
+    """Escape hatch: make every differing file match `side`, ignoring snapshots and the other side's changes."""
     for a in actions:
         if a["action"] in ("none", "both_deleted"):
             continue
@@ -626,27 +639,33 @@ def apply_force_override(actions: list, side: str) -> None:
             a["action"] = "delete_target" if a["t"] is None else "push"
         else:
             a["action"] = "delete_template" if a["l"] is None else "pullback"
-        a.pop("merge_outcome", None)
+        a.pop("outcome", None)
         a.pop("exec_conflict", None)
         a.pop("settings_conflict_paths", None)
 
 
-def execute_sync(short_id: str, template_root: str, target_root: str, actions: list, issues: list, is_user: bool = False) -> int:
-    """真正落盘：备份、原子写、删除、三方合并（含 settings.json 的键级合并），然后是一次性的挂起交互，最后才是快照更新。
+def execute_sync(short_id: str, template_root: str, target_root: str, actions: list, issues: list, title: str, is_user: bool = False) -> int:
+    """Apply the plan, hold once for review, then snapshot both sides' actual content.
 
-    快照必须等这一切（包括用户在挂起期间可能做的手工改动）结束后才读取两侧此刻的实际内容来存——写完立刻存会让「撤销即登记」失效。
+    Snapshots wait until after the hold so reverts made during it register as customizations.
 
-    例如：回流写进模板仓后马上存快照，用户随后 git checkout 撤掉这次回流，下次同步会读到「模板侧变了」，把撤销后的内容当新改动又推回目标仓。
-
-    返回值是 CLI 退出码：0 正常。
-
-    本次存在挂起项但没有人能在场确认（非交互终端），或者回车之后文件此刻仍带着冲突标记（有人在场但没有真的处理完），都返回 1——这些文件的快照被刻意不落，留到下次同步继续报，不能让命令悄悄退出成功、把没解决的冲突当没发生过。
+    Returns 1 if held files went unconfirmed (no terminal) or still have conflict markers; their snapshots aren't saved, so they are reported again.
     """
     batch_dir = os.path.join(BACKUP_ROOT, datetime.now().strftime("%Y%m%dT%H%M%S%f"))
 
     snapshot_pending: list[str] = []
     hold_relpaths: list[str] = []
     editor_paths: list[str] = []
+
+    def record_merge(a, outcome, exec_conflict, paths):
+        a["outcome"] = outcome
+        if exec_conflict:
+            a["exec_conflict"] = True
+        if outcome not in _NEVER_SNAPSHOT_OUTCOMES:
+            snapshot_pending.append(a["relpath"])
+            if outcome in _HOLD_OUTCOMES:
+                hold_relpaths.append(a["relpath"])
+        editor_paths.extend(paths)
 
     for a in actions:
         rel = a["relpath"]
@@ -655,25 +674,21 @@ def execute_sync(short_id: str, template_root: str, target_root: str, actions: l
             continue
 
         if is_settings_json(rel) and action in ("push", "pullback", "needs_merge", "first_adopt"):
-            outcome, exec_conflict, paths = apply_settings_merge(
-                batch_dir, short_id, template_root, target_root, a, issues
-            )
-            a["merge_outcome"] = outcome
-            if exec_conflict:
-                a["exec_conflict"] = True
-            if outcome not in _NEVER_SNAPSHOT_OUTCOMES:
-                snapshot_pending.append(rel)
-                if outcome in _HOLD_OUTCOMES:
-                    hold_relpaths.append(rel)
-            editor_paths.extend(paths)
+            record_merge(a, *apply_settings_merge(batch_dir, short_id, template_root, target_root, a))
+            if a["outcome"] == "settings_merged_clean" and action != "needs_merge":
+                # To the user, a one-sided change merged cleanly is just a push or pullback.
+                del a["outcome"]
             continue
 
-        if action == "push" or action == "first_adopt":
-            if apply_write(batch_dir, short_id, "target", target_root, rel, a["l"], a["t"], issues):
+        if action in ("push", "first_adopt", "pullback"):
+            if action == "pullback":
+                write = ("template", template_root, a["t"], a["l"])
+            else:
+                write = ("target", target_root, a["l"], a["t"])
+            if apply_writes(batch_dir, short_id, rel, [write]):
                 snapshot_pending.append(rel)
-        elif action == "pullback":
-            if apply_write(batch_dir, short_id, "template", template_root, rel, a["t"], a["l"], issues):
-                snapshot_pending.append(rel)
+            else:
+                a["outcome"] = "out_of_scope"
         elif action == "delete_target":
             apply_delete(batch_dir, short_id, "target", target_root, rel, a["l"])
             clear_snapshot_pair(short_id, rel)
@@ -683,35 +698,31 @@ def execute_sync(short_id: str, template_root: str, target_root: str, actions: l
         elif action == "both_deleted":
             clear_snapshot_pair(short_id, rel)
         elif action == "needs_merge":
-            outcome, exec_conflict, paths = apply_needs_merge(
-                batch_dir, short_id, template_root, target_root, a, issues
-            )
-            a["merge_outcome"] = outcome
-            if exec_conflict:
-                a["exec_conflict"] = True
-            if outcome not in _NEVER_SNAPSHOT_OUTCOMES:
-                snapshot_pending.append(rel)
-                if outcome in _HOLD_OUTCOMES:
-                    hold_relpaths.append(rel)
-            editor_paths.extend(paths)
+            record_merge(a, *apply_needs_merge(batch_dir, short_id, template_root, target_root, a))
 
-    print(f"目标 {short_id} ({target_root}) 同步结果：")
-    print_report(actions, issues)
+    repo_name = "~/.claude" if is_user else "repo"
+    print(f"Syncing {title}")
+    print_report(actions, issues, repo_name)
 
-    # 一次同步只挂起一次：只要这批里有文件的快照要等这次确认之后才存（push/pullback/first_adopt/合并），就等一次回车再落快照，让用户有机会在两侧工作区里用 git diff / checkout 检查、撤销。纯删除动作已经在上面立刻完成并清了快照，没有什么要等的，不占用这次确认。
+    # One hold per sync, covering every file whose snapshot waits on confirmation. Deletions are already done.
     got_confirmation = True
     if snapshot_pending or editor_paths:
         if editor_paths:
-            print(f"{len(editor_paths)} 个文件需要人工确认：")
+            print("Files to review:")
             for p in editor_paths:
                 print(f"  {p}")
             open_editor(editor_paths)
         if is_user:
-            print(f"本次备份目录：{batch_dir}（用户级没有 git diff 可用，可以拿它跟现状比对）")
-        print("处理完毕后按回车继续，工具将按两侧此刻的实际内容重新落定快照……")
-        got_confirmation = wait_for_enter()
+            check = f"Overwritten files were backed up to {batch_dir}; diff against ~/.claude to check."
+        else:
+            check = "Check the changes with git diff in both repos."
+        got_confirmation = wait_for_enter(
+            f"{check}\n"
+            f"Revert anything you don't want. Changes you revert in the template stay as customizations of {'~/.claude' if is_user else 'this repo'}.\n"
+            "Press Enter when done..."
+        )
         if not got_confirmation and editor_paths:
-            print("stdin 不是交互终端，本次有未处理的挂起项：不会自动确认，这些文件的快照不落，留到下次同步继续报。")
+            print("No terminal to confirm. Files needing review are left as is and will be reported again next run.")
 
     withheld = set(hold_relpaths) if (editor_paths and not got_confirmation) else set()
     still_conflicted: list[str] = []
@@ -729,13 +740,13 @@ def execute_sync(short_id: str, template_root: str, target_root: str, actions: l
         save_one_snapshot(snapshot_dir(short_id, "target"), rel, l_now)
 
     if still_conflicted:
-        print("以下文件此刻仍带冲突标记，快照不落，留到下次同步继续报：")
+        print("These files still have conflict markers and will be reported again next run:")
         for rel in still_conflicted:
             print(f"  {rel}")
 
     exit_code = 1 if (editor_paths and not got_confirmation) or still_conflicted else 0
     if exit_code == 0:
-        print(f"目标 {short_id} 同步完成")
+        print("Done.")
     return exit_code
 
 
@@ -755,30 +766,30 @@ def cmd_add(args: argparse.Namespace) -> int:
     template = args.template
     template_dir = os.path.join(PROJECTS_ROOT, template)
     if not os.path.isdir(template_dir):
-        print(f"错误：模板不存在 projects/{template}", file=sys.stderr)
+        print(f"error: no template named '{template}' under projects/", file=sys.stderr)
         return 1
 
     target_path = os.path.abspath(args.target_path)
     if not os.path.isdir(target_path):
-        print(f"错误：目标仓路径不存在或不是目录：{target_path}", file=sys.stderr)
+        print(f"error: not a directory: {target_path}", file=sys.stderr)
         return 1
 
     config = load_config()
     for short_id, entry in config["targets"].items():
         if os.path.abspath(entry["path"]) == target_path:
-            print(f"错误：该路径已登记为 {short_id}", file=sys.stderr)
+            print(f"error: {target_path} is already registered as repo {short_id}", file=sys.stderr)
             return 1
 
     short_id = str(config["next_id"])
     config["next_id"] += 1
     config["targets"][short_id] = {"path": target_path, "template": template}
     save_config(config)
-    print(f"已登记：{short_id} -> {target_path}（模板：{template}）")
+    print(f"Registered repo {short_id}: {target_path} (template: {template})")
     return 0
 
 
 def resolve_target(config: dict, ref: str):
-    """按短 ID 或路径找目标仓记录，找不到返回 (None, None)。"""
+    """Find a target by short ID or path; (None, None) if not found."""
     if ref in config["targets"]:
         return ref, config["targets"][ref]
     ref_abs = os.path.abspath(ref)
@@ -789,76 +800,74 @@ def resolve_target(config: dict, ref: str):
 
 
 def pick_target_interactively(config: dict):
-    """sync 不带参数时的交互选择：列出已登记目标仓，选一个、确认后执行。非交互终端直接报错退出，不猜用户想同步哪个。"""
+    """Pick a registered repo interactively; refuses without a terminal."""
     if not sys.stdin.isatty():
-        print("错误：未指定目标，且当前不是交互终端，无法选择", file=sys.stderr)
+        print("error: no repo given, and no terminal to choose one", file=sys.stderr)
         return None, None
     targets = sorted(config["targets"].items(), key=lambda kv: int(kv[0]))
     if not targets:
-        print("错误：尚未登记任何目标仓，请先用 add 登记", file=sys.stderr)
+        print("error: no repos registered yet. Add one: sync.py add <path> --template <name>", file=sys.stderr)
         return None, None
-    print("已登记的目标仓：")
+    print("Registered repos:")
     for i, (short_id, entry) in enumerate(targets, 1):
-        print(f"  {i}. [{short_id}] {entry['path']}（模板：{entry['template']}）")
+        print(f"  {i}. [{short_id}] {entry['path']} ({entry['template']})")
     try:
-        choice = input("选择序号：").strip()
+        choice = input("Choose a number: ").strip()
     except EOFError:
-        print("错误：未读到选择，取消", file=sys.stderr)
+        print("Cancelled.")
         return None, None
     if not choice.isdigit() or not (1 <= int(choice) <= len(targets)):
-        print("错误：无效选择，取消", file=sys.stderr)
+        print("error: invalid choice", file=sys.stderr)
         return None, None
     short_id, entry = targets[int(choice) - 1]
     try:
-        confirm = input(f"确认同步 [{short_id}] {entry['path']}？(y/N) ").strip().lower()
+        confirm = input(f"Sync [{short_id}] {entry['path']}? [y/N] ").strip().lower()
     except EOFError:
         confirm = ""
     if confirm != "y":
-        print("已取消")
+        print("Cancelled.")
         return None, None
     return short_id, entry
 
 
+def status_summary(short_id: str, template_root: str, target_root: str) -> str:
+    actions, issues = plan_sync(short_id, template_root, target_root)
+    pending = sum(1 for a in actions if a["action"] not in _SILENT_ACTIONS)
+    customized = sum(
+        1 for a in actions if a["ts"] is not None and a["ls"] is not None and a["ts"] != a["ls"]
+    )
+    summary = f"{pending} pending, {customized} customized"
+    if issues:
+        summary += f", {len(issues)} skipped"
+    return summary
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config()
+    targets = sorted(config["targets"].items(), key=lambda kv: int(kv[0]))
+    user_available = os.path.isdir(USER_TEMPLATE_ROOT)
+    if not targets and not user_available:
+        print("No repos registered.")
+        return 0
+
     rows = [
         (short_id, entry["path"], os.path.join(PROJECTS_ROOT, entry["template"]), entry["template"])
-        for short_id, entry in sorted(config["targets"].items(), key=lambda kv: int(kv[0]))
+        for short_id, entry in targets
     ]
-    user_available = os.path.isdir(USER_TEMPLATE_ROOT)
-    if not rows and not user_available:
-        print("尚未登记任何目标仓")
-        return 0
+    if user_available:
+        rows.append((USER_SHORT_ID, USER_TARGET_ROOT, USER_TEMPLATE_ROOT, "user/claude"))
 
     for short_id, target_root, template_root, template_name in rows:
         if not os.path.isdir(target_root):
-            print(f"{short_id}\t{target_root}\t模板={template_name}\t错误：目标仓路径不存在")
-            continue
-        if not os.path.isdir(template_root):
-            print(f"{short_id}\t{target_root}\t模板={template_name}\t错误：模板不存在")
-            continue
-        try:
-            actions, issues = plan_sync(short_id, template_root, target_root)
-        except OSError as e:
-            print(f"{short_id}\t{target_root}\t模板={template_name}\t错误：{e}")
-            continue
-        pending = sum(1 for a in actions if a["action"] != "none")
-        customized = sum(
-            1 for a in actions if a["ts"] is not None and a["ls"] is not None and a["ts"] != a["ls"]
-        )
-        extra = f"\t链接问题={len(issues)}" if issues else ""
-        print(f"{short_id}\t{target_root}\t模板={template_name}\t待同步={pending}\t定制={customized}{extra}")
-
-    if user_available:
-        try:
-            actions, issues = plan_sync(USER_SHORT_ID, USER_TEMPLATE_ROOT, USER_TARGET_ROOT)
-            pending = sum(1 for a in actions if a["action"] != "none")
-            customized = sum(
-                1 for a in actions if a["ts"] is not None and a["ls"] is not None and a["ts"] != a["ls"]
-            )
-            print(f"{USER_SHORT_ID}\t{USER_TARGET_ROOT}\t模板=user/claude\t待同步={pending}\t定制={customized}")
-        except OSError as e:
-            print(f"{USER_SHORT_ID}\t{USER_TARGET_ROOT}\t模板=user/claude\t错误：{e}")
+            summary = "repo not found"
+        elif not os.path.isdir(template_root):
+            summary = "template not found"
+        else:
+            try:
+                summary = status_summary(short_id, template_root, target_root)
+            except OSError as e:
+                summary = f"error: {e}"
+        print(f"[{short_id}] {target_root} ({template_name}): {summary}")
     return 0
 
 
@@ -874,24 +883,32 @@ def cmd_sync(args: argparse.Namespace) -> int:
     else:
         short_id, entry = resolve_target(config, args.target)
         if short_id is None:
-            print(f"错误：未登记的目标仓：{args.target}，请先用 add 登记", file=sys.stderr)
+            print(
+                f"error: unknown repo '{args.target}'. Register it first: sync.py add <path> --template <name>",
+                file=sys.stderr,
+            )
             return 1
 
     is_user = short_id == USER_SHORT_ID
     template_root = USER_TEMPLATE_ROOT if is_user else os.path.join(PROJECTS_ROOT, entry["template"])
     target_root = entry["path"]
+    title = (
+        f"{target_root} ⇄ user/claude" if is_user
+        else f"repo {short_id} ({target_root}) ⇄ template {entry['template']}"
+    )
 
     if not os.path.isdir(template_root):
-        print(f"错误：模板不存在 {template_root}", file=sys.stderr)
+        print(f"error: template not found: {template_root}", file=sys.stderr)
         return 1
     if not os.path.isdir(target_root):
-        hint = "" if is_user else "，如已迁移请手工更新 .state/config.json"
-        print(f"错误：目标路径不存在：{target_root}{hint}", file=sys.stderr)
+        hint = "" if is_user else ". If it moved, update its path in .state/config.json"
+        print(f"error: repo not found at {target_root}{hint}", file=sys.stderr)
         return 1
 
-    if args.force_template or args.force_target:
-        side_name, side_key = ("模板仓", "template") if args.force_template else ("目标仓", "target")
-        print(f"警告：--force-{side_key} 会忽略快照与对侧改动，以{side_name}为准全量覆盖，可能抹掉一批定制。")
+    if args.force_template:
+        print("Warning: --force-template makes the repo match the template, discarding repo customizations.")
+    elif args.force_target:
+        print("Warning: --force-target makes the template match the repo, discarding template changes.")
 
     try:
         actions, issues = plan_sync(short_id, template_root, target_root)
@@ -902,22 +919,22 @@ def cmd_sync(args: argparse.Namespace) -> int:
             apply_force_override(actions, "target")
 
         if args.dry_run:
-            print(f"[dry-run] 目标 {short_id} ({target_root})")
-            print_report(actions, issues)
+            print(f"Dry run, nothing will be written. {title}")
+            print_report(actions, issues, "~/.claude" if is_user else "repo")
             return 0
 
-        return execute_sync(short_id, template_root, target_root, actions, issues, is_user=is_user)
+        return execute_sync(short_id, template_root, target_root, actions, issues, title, is_user=is_user)
     except OSError as e:
-        # 文件缺席已经在 read_state 里被识别并当作 None 处理；能冒到这里的只有权限不足一类真正的 I/O 错误，不能被当成删除去传播，中止本次同步。
-        print(f"错误：同步中止，{e}", file=sys.stderr)
+        # Absence is handled in read_state, so this is a real I/O error; abort rather than treat it as a deletion.
+        print(f"error: sync aborted: {e}", file=sys.stderr)
         return 1
 
 
 def cmd_adopt(args: argparse.Namespace) -> int:
-    """把目标仓（或用户级落盘目录）里的一个文件提升为模板文件：从路径反查它属于哪个已登记的目标，拷到该目标所用模板的相同相对路径下，再建立快照对。模板侧已经有同名文件时报错退出，不覆盖。"""
+    """Copy a file from a registered repo or ~/.claude into its template and record a snapshot pair. Never overwrites an existing template file."""
     file_path = os.path.abspath(args.file_path)
     if not os.path.isfile(file_path):
-        print(f"错误：文件不存在：{file_path}", file=sys.stderr)
+        print(f"error: file not found: {file_path}", file=sys.stderr)
         return 1
 
     config = load_config()
@@ -940,55 +957,58 @@ def cmd_adopt(args: argparse.Namespace) -> int:
             match = (short_id, target_root, template_root, rel.replace(os.sep, "/"))
 
     if match is None:
-        print("错误：该文件不属于任何已登记的目标仓", file=sys.stderr)
+        print(f"error: {file_path} is not inside a registered repo or ~/.claude", file=sys.stderr)
         return 1
     short_id, target_root, template_root, rel = match
 
-    if is_excluded(rel):
-        print(f"错误：{rel} 不参与同步，不能提升为模板文件", file=sys.stderr)
+    if is_excluded(rel) or gitignored_relpaths(template_root, [rel]):
+        print(f"error: {rel} is excluded from sync (gitignored or machine-local)", file=sys.stderr)
         return 1
 
     state = read_state(target_root, rel)
     if state is None:
-        print(f"错误：读取失败：{file_path}", file=sys.stderr)
+        print(f"error: can't read {file_path}", file=sys.stderr)
         return 1
 
+    template_path = os.path.join(template_root, *rel.split("/"))
     if read_state(template_root, rel) is not None:
-        print(f"错误：模板已有同名文件 {os.path.join(template_root, *rel.split('/'))}，不覆盖", file=sys.stderr)
+        print(f"error: template already has {template_path}; not overwriting", file=sys.stderr)
         return 1
 
     write_state(template_root, rel, state)
     save_snapshot_pair(short_id, template_root, target_root, rel)
-    print(f"已提升为模板文件：{rel} -> {os.path.join(template_root, *rel.split('/'))}")
+    print(f"Added to template: {rel} → {template_path}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sync.py", description="模板仓与目标仓的配置同步工具")
+    parser = argparse.ArgumentParser(
+        prog="sync.py", description="Sync AI tool config between this template repo and your project repos."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_add = sub.add_parser("add", help="登记一个目标仓")
-    p_add.add_argument("target_path", help="目标仓路径")
-    p_add.add_argument("--template", required=True, help="使用的模板名（projects/<模板名>）")
+    p_add = sub.add_parser("add", help="register a repo")
+    p_add.add_argument("target_path", help="path to the repo")
+    p_add.add_argument("--template", required=True, help="template name under projects/")
     p_add.set_defaults(func=cmd_add)
 
-    p_status = sub.add_parser("status", help="列出各目标仓（含用户级）的待同步与定制数量")
+    p_status = sub.add_parser("status", help="show pending changes and customizations per repo, including ~/.claude")
     p_status.set_defaults(func=cmd_status)
 
-    p_sync = sub.add_parser("sync", help="同步一个目标；不带参数进交互选择；user 表示用户级")
-    p_sync.add_argument("target", nargs="?", default=None, help="目标仓短 ID / 路径 / user")
-    p_sync.add_argument("--dry-run", action="store_true", help="只打印清单，不写入任何内容")
+    p_sync = sub.add_parser("sync", help="sync one repo; 'user' for ~/.claude; omit to pick interactively")
+    p_sync.add_argument("target", nargs="?", default=None, help="repo ID, repo path, or 'user'")
+    p_sync.add_argument("--dry-run", action="store_true", help="show what would change without writing anything")
     force_group = p_sync.add_mutually_exclusive_group()
     force_group.add_argument(
-        "--force-template", action="store_true", help="逃生舱：忽略快照与定制，以模板仓为准全量覆盖目标"
+        "--force-template", action="store_true", help="make the repo match the template, discarding repo customizations"
     )
     force_group.add_argument(
-        "--force-target", action="store_true", help="逃生舱：忽略快照与定制，以目标为准全量覆盖模板仓"
+        "--force-target", action="store_true", help="make the template match the repo"
     )
     p_sync.set_defaults(func=cmd_sync)
 
-    p_adopt = sub.add_parser("adopt", help="把目标里的一个文件提升为模板文件")
-    p_adopt.add_argument("file_path", help="目标（目标仓或 ~/.claude）内某文件的路径")
+    p_adopt = sub.add_parser("adopt", help="copy a file from a repo or ~/.claude into its template")
+    p_adopt.add_argument("file_path", help="path to a file inside a registered repo or ~/.claude")
     p_adopt.set_defaults(func=cmd_adopt)
 
     return parser

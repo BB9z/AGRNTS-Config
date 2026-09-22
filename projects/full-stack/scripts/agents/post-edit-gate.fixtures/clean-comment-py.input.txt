@@ -1,0 +1,4 @@
+before = 1
+
+# a short comment, nothing wrong here
+after = 2

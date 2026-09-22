@@ -1,0 +1,3 @@
+const before = 1
+
+// this behavior no longer applies here
