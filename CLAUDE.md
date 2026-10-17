@@ -16,7 +16,7 @@
 
 - 设计来源是 `docs/config-sync.decision.md`，改行为先看它，落地后回写
 - 代码注释里不写决议编号
-- 测试：`python3 -m unittest discover -s tests`
+- 测试：`python3 -m unittest discover -s tests`；载荷脚本的测试也放 `tests/`，不进模板，如 `node --test tests/post-edit-gate/post-edit-gate.test.mjs`
 - 临时文件只用 cwd 下的 `tmp/`
 
 ## 红线
