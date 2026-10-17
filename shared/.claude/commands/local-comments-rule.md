@@ -1,1 +1,1 @@
-注释与文档需要遵循：自然段落可换行，不硬换行；注释最小化，只加必要的；描述站在长期视角，禁止本地补丁式
+Comments must follow: wrap at natural paragraph breaks, no hard-wrapping; keep comments minimal — add only what's necessary; write from a long-term perspective, not as local patch-style notes.

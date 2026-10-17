@@ -1,8 +1,8 @@
-// PostToolUse gate for Edit/Write. Checks only the text an edit introduced, so pre-existing violations never fire.
+// PostToolUse gate for Edit/Write. Checks only what an edit touched: introduced lines for hard wraps, overlapping comment blocks for comment quality.
 //
 // It runs after the tool and cannot undo an edit: `hint` findings become additionalContext, `block` findings go to stderr with exit 2 — both nudge, neither vetoes.
 
-import { appendFileSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -11,16 +11,12 @@ const THRESHOLD = 80
 // Max width of an evidence snippet echoed back to the agent; unrelated to THRESHOLD.
 const SNIPPET_MAX = 80
 
-// When true, append each invocation's parsed input and emitted result to the jsonl beside this file.
-const DEBUG = false
-const DEBUG_LOG = new URL('./post-edit-gate.debug.jsonl', import.meta.url)
-
 // MARK: types
 
 /**
  * @typedef {Object} HookPayload
  * @property {string} [tool_name]
- * @property {{file_path?: string, file_content?: string, new_string?: string}} [tool_input]
+ * @property {{file_path?: string, content?: string, new_string?: string}} [tool_input]
  */
 
 /**
@@ -63,10 +59,9 @@ const DEBUG_LOG = new URL('./post-edit-gate.debug.jsonl', import.meta.url)
 function main() {
   const payload = parsePayload(readStdin())
   const result = evaluate(payload)
-  if (DEBUG) appendDebug(payload, result)
   if (result.stderr) process.stderr.write(result.stderr)
   if (result.stdout) process.stdout.write(result.stdout)
-  process.exit(result.exitCode)
+  process.exitCode = result.exitCode
 }
 
 /**
@@ -213,16 +208,24 @@ class Language {
         i += 2
         emit('block', startLine, startCol, startIdx)
       } else if (c === "'" || c === '"' || c === '`') {
+        // Only template literals span lines; an unclosed quote ends at the newline, so a stray apostrophe (e.g. YAML `don't`) can't swallow later comments.
+        const multiline = c === '`'
         i++
         while (i < n && src[i] !== c) {
-          if (src[i] === '\\') i += 2
-          else if (src[i] === '\n') {
+          if (src[i] === '\\') {
+            if (src[i + 1] === '\n') {
+              line++
+              lineStart = i + 2
+            }
+            i += 2
+          } else if (src[i] === '\n') {
+            if (!multiline) break
             line++
             i++
             lineStart = i
           } else i++
         }
-        i++
+        if (src[i] === c) i++
       } else {
         i++
       }
@@ -284,7 +287,7 @@ class Edit {
     const input = payload?.tool_input
     if (!input?.file_path) return null
     const toolName = payload?.tool_name
-    const text = toolName === 'Write' ? input.file_content : input.new_string
+    const text = toolName === 'Write' ? input.content : input.new_string
     if (typeof text !== 'string' || text.length === 0) return null
     const lang = Language.for(input.file_path)
     if (!lang) return null
@@ -402,9 +405,14 @@ const COMMENT_KEYWORDS = [
  * @returns {Finding[]}
  */
 function findCommentIssues(edit) {
-  if (!edit.lang.mayContainComment(edit.text)) return []
   const content = edit.content
   if (content === null) return []
+  // Without a marker the edit may sit inside a comment, but only a unique snippet locates it reliably.
+  if (
+    !edit.lang.mayContainComment(edit.text) &&
+    content.indexOf(edit.text) !== content.lastIndexOf(edit.text)
+  )
+    return []
 
   const start = edit.baseLine + 1
   const end = edit.baseLine + edit.text.split('\n').length
@@ -575,21 +583,6 @@ function readStdin() {
     return readFileSync(0, 'utf8')
   } catch {
     return ''
-  }
-}
-
-/**
- * @param {HookPayload | null} payload
- * @param {EvalResult} result
- */
-function appendDebug(payload, result) {
-  try {
-    appendFileSync(
-      DEBUG_LOG,
-      `${JSON.stringify({ time: new Date().toISOString(), payload, result })}\n`,
-    )
-  } catch {
-    // best effort; a failed debug write must not crash the hook
   }
 }
 

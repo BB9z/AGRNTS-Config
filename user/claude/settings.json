@@ -6,6 +6,8 @@
   },
   "autoCompactEnabled": false,
   "autoUpdatesChannel": "stable",
+  "cleanupPeriodDays": 90,
+  "disableClaudeAiConnectors": true,
   "editorMode": "normal",
   "effortLevel": "high",
   "enabledPlugins": {
@@ -18,8 +20,8 @@
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
     "CLAUDE_CODE_EFFORT_LEVEL": "auto",
     "DISABLE_AUTOUPDATER": "1",
-    "DISABLE_FEEDBACK_COMMAND": "1",
     "DISABLE_ERROR_REPORTING": "1",
+    "DISABLE_FEEDBACK_COMMAND": "1",
     "DISABLE_TELEMETRY": "1",
     "DO_NOT_TRACK": "1",
     "ENABLE_LSP_TOOL": "1"
@@ -33,37 +35,213 @@
     }
   },
   "hooks": {
+    "ConfigChange": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "Elicitation": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "ElicitationResult": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "FileChanged": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "InstructionsLoaded": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
     "PermissionRequest": [
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "say '请求授权'"
+            "command": "say '请求授权'",
+            "type": "command"
           },
           {
+            "timeout": 5,
             "type": "http",
-            "url": "http://127.0.0.1:7788/hooks/event",
-            "timeout": 5
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
         "hooks": [
           {
-            "type": "command",
-            "command": "rtk hook claude"
+            "command": "rtk hook claude",
+            "type": "command"
           }
-        ]
+        ],
+        "matcher": "Bash"
       },
       {
         "hooks": [
           {
+            "timeout": 5,
             "type": "http",
-            "url": "http://127.0.0.1:7788/hooks/event",
-            "timeout": 5
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "Setup": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
           }
         ]
       }
@@ -72,14 +250,113 @@
       {
         "hooks": [
           {
-            "type": "command",
             "command": "jq -r '.last_assistant_message // \"完成了\"' | head -c 40 | say",
-            "timeout": 10
+            "timeout": 10,
+            "type": "command"
           },
           {
+            "timeout": 5,
             "type": "http",
-            "url": "http://127.0.0.1:7788/hooks/event",
-            "timeout": 5
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "TaskCreated": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "timeout": 5,
+            "type": "http",
+            "url": "http://127.0.0.1:7788/hooks/event"
           }
         ]
       }
@@ -87,38 +364,24 @@
   },
   "inputNeededNotifEnabled": true,
   "permissions": {
+    "additionalDirectories": [],
     "allow": [
-      "Bash(./scripts/ci-test.sh:*)",
       "Bash(brew:*)",
       "Bash(find:*)",
-      "Bash(gh pr:*)",
-      "Bash(gh repo view:*)",
-      "Bash(git:*)",
       "Bash(grep:*)",
-      "Bash(ln -s:*)",
       "Bash(ls:*)",
-      "Bash(npx tsx:*)",
-      "Bash(pnpm *)",
       "Bash(source .env)",
-      "Bash(uv run *)",
-      "Bash(echo \"exit=$?\")",
-      "Bash(tail -3 /tmp_check.log)",
-      "Bash(rm -f /tmp_check.log)",
-      "Bash(grep ABORT /tmp_out.log)",
-      "Bash(rm -f /tmp_out.log)",
-      "Bash(rmdir tmp/f1check_tamper tmp/f1check_tamper2)"
+      "Bash(uv run *)"
     ],
-    "defaultMode": "default",
-    "deny": [],
     "ask": [
       "Bash(git push *)",
       "Bash(git pr create *)"
     ],
-    "additionalDirectories": []
+    "defaultMode": "default",
+    "deny": []
   },
   "preferredNotifChannel": "auto",
   "remoteControlAtStartup": false,
-  "teammateMode": "auto",
-  "cleanupPeriodDays": 90,
-  "switchModelsOnFlag": false
+  "switchModelsOnFlag": false,
+  "teammateMode": "auto"
 }
