@@ -504,6 +504,7 @@ def is_settings_json(relpath: str) -> bool:
 
 
 _SETTINGS_INVALID = object()
+_ABSENT = object()
 
 
 def _load_json_side(state):
@@ -515,6 +516,21 @@ def _load_json_side(state):
     except (UnicodeDecodeError, json.JSONDecodeError):
         return _SETTINGS_INVALID
     return obj if isinstance(obj, dict) else _SETTINGS_INVALID
+
+
+def is_customized(relpath: str, ts, ls) -> bool:
+    """Whether the snapshot pair records a customization. For settings.json only template-managed leaves count; target-only keys and key order don't."""
+    if ts is None or ls is None:
+        return False
+    if not is_settings_json(relpath) or ts == ls:
+        return ts != ls
+    if ts[1] != ls[1]:
+        return True
+    ts_obj, ls_obj = _load_json_side(ts), _load_json_side(ls)
+    if _SETTINGS_INVALID in (ts_obj, ls_obj):
+        return True
+    ls_leaves = jsonmerge.flatten(ls_obj)
+    return any(ls_leaves.get(path, _ABSENT) != value for path, value in jsonmerge.flatten(ts_obj).items())
 
 
 def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dict):
@@ -837,9 +853,7 @@ def pick_target_interactively(config: dict):
 def status_summary(short_id: str, template_root: str, target_root: str) -> str:
     actions, issues = plan_sync(short_id, template_root, target_root)
     pending = sum(1 for a in actions if a["action"] not in _SILENT_ACTIONS)
-    customized = sum(
-        1 for a in actions if a["ts"] is not None and a["ls"] is not None and a["ts"] != a["ls"]
-    )
+    customized = sum(1 for a in actions if is_customized(a["relpath"], a["ts"], a["ls"]))
     summary = f"{pending} pending, {customized} customized"
     if issues:
         summary += f", {len(issues)} skipped"

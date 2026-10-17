@@ -203,6 +203,24 @@ class StatusCommandTests(SyncTestCase):
         self.assertIn(": 1 pending", out)
         self.assertIn("0 customized", out)
 
+    def test_status_settings_customized_counts_only_managed_keys(self):
+        tpl = self.make_template("tpl")
+        self.write(tpl, "settings.json", json.dumps({"a": 1, "b": 2}))
+        self.add_target("tpl")
+        self.write(self.target_root, "settings.json", json.dumps({"own": 1, "b": 2, "a": 1}))
+        self.run_cli("sync", "1")
+
+        code, out = self.run_cli("status")
+        self.assertIn("0 customized", out)
+
+        # A managed key with a different value in the target snapshot is a real customization.
+        target_snapshot = os.path.join(self.module.snapshot_dir("1", "target"), "settings.json")
+        with open(target_snapshot, "w") as f:
+            f.write(json.dumps({"own": 1, "b": 3, "a": 1}))
+        self.write(self.target_root, "settings.json", json.dumps({"own": 1, "b": 3, "a": 1}))
+        code, out = self.run_cli("status")
+        self.assertIn("1 customized", out)
+
 
 class SyncDecisionTableTests(SyncTestCase):
     def test_first_sync_pushes_new_files_and_skips_settings_local(self):
