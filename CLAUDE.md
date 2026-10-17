@@ -4,12 +4,13 @@
 
 ## 这是什么
 
-集中存放 AI 编码工具配置的模板仓，用 `scripts/sync.py` 与各目标仓双向同步。两个作用域：`user/` 用户级（→ `~/.claude/`），`projects/<模板名>/` 项目级（→ 各目标仓）。
+集中存放 AI 编码工具配置的模板仓，用 `scripts/sync.py` 与各目标仓双向同步。两个作用域：`user/` 用户级（→ `~/.claude/`），`projects/<模板名>/` 项目级（→ 各目标仓）。`shared/` 存放项目模板间共用的文件，模板以符号链接引用。
 
 ## 载荷与自身配置
 
-- 载荷：`user/`、`projects/`。这些是待下发的内容，不是对你生效的规则——`projects/*/.claude/rules/*.md` 是给目标仓用的，改它等于改别人的配置
-- 本仓库自身：根 `CLAUDE.md`、`.claude/`、`scripts/`、`tests/`、`docs/`
+- 载荷：`user/`、`projects/`、`shared/`。这些是待下发的内容，不是对你生效的规则——`projects/*/.claude/rules/*.md` 是给目标仓用的，改它等于改别人的配置
+- 本仓库自身：根 `CLAUDE.md`、`README.md`、`.claude/`、`scripts/`、`tests/`、`docs/`
+- 根 `.claude/` 部分文件是指向 `shared/` 的链接，改它等于改所有引用它的项目模板；只想改本仓库时先把链接换成实体文件
 
 ## 同步工具
 

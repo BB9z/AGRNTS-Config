@@ -120,6 +120,5 @@
   "remoteControlAtStartup": false,
   "teammateMode": "auto",
   "cleanupPeriodDays": 90,
-  "switchModelsOnFlag": true,
-  "model": "opus[1m]"
+  "switchModelsOnFlag": false
 }
