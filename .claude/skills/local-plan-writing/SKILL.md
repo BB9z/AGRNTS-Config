@@ -1,0 +1,1 @@
+../../../shared/.claude/skills/local-plan-writing/SKILL.md

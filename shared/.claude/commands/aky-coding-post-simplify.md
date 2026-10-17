@@ -1,0 +1,1 @@
+Reflect on the code just written. Can it be cleaner and easier to understand — clearer naming, less indirection, simpler control flow, comments only where necessary? List concrete improvements only; do not edit.

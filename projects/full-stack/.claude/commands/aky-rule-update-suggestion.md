@@ -1,1 +1,1 @@
-Based on findings from this conversation, which docs need updating or additions? Check CLAUDE.md, rules files, READMEs, etc. Only list if there's substantive content to change.
+../../../../shared/.claude/commands/aky-rule-update-suggestion.md

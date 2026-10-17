@@ -1,0 +1,1 @@
+../../../../shared/.claude/commands/local-comments-rule.md

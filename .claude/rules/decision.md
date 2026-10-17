@@ -1,0 +1,1 @@
+../../shared/.claude/rules/decision.md

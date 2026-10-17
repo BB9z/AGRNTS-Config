@@ -610,7 +610,9 @@ def wait_for_enter(prompt: str) -> bool:
 
 
 def open_editor(paths: list[str]) -> None:
-    """Open files in $EDITOR without waiting, so the user can edit either side by any means during the hold."""
+    """Open files in $EDITOR without waiting, so the user can edit either side by any means during the hold. Does nothing without a terminal."""
+    if not sys.stdin.isatty():
+        return
     editor = os.environ.get("EDITOR")
     if not editor:
         print("$EDITOR is not set; open these files yourself:")
@@ -642,6 +644,7 @@ def apply_force_override(actions: list, side: str) -> None:
         a.pop("outcome", None)
         a.pop("exec_conflict", None)
         a.pop("settings_conflict_paths", None)
+        a["forced"] = True
 
 
 def execute_sync(short_id: str, template_root: str, target_root: str, actions: list, issues: list, title: str, is_user: bool = False) -> int:
@@ -673,7 +676,8 @@ def execute_sync(short_id: str, template_root: str, target_root: str, actions: l
         if action == "none":
             continue
 
-        if is_settings_json(rel) and action in ("push", "pullback", "needs_merge", "first_adopt"):
+        # Forced overwrites replace settings.json whole instead of merging keys.
+        if is_settings_json(rel) and not a.get("forced") and action in ("push", "pullback", "needs_merge", "first_adopt"):
             record_merge(a, *apply_settings_merge(batch_dir, short_id, template_root, target_root, a))
             if a["outcome"] == "settings_merged_clean" and action != "needs_merge":
                 # To the user, a one-sided change merged cleanly is just a push or pullback.
@@ -865,7 +869,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         else:
             try:
                 summary = status_summary(short_id, template_root, target_root)
-            except OSError as e:
+            except (OSError, RuntimeError) as e:
                 summary = f"error: {e}"
         print(f"[{short_id}] {target_root} ({template_name}): {summary}")
     return 0
@@ -924,8 +928,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             return 0
 
         return execute_sync(short_id, template_root, target_root, actions, issues, title, is_user=is_user)
-    except OSError as e:
-        # Absence is handled in read_state, so this is a real I/O error; abort rather than treat it as a deletion.
+    except (OSError, RuntimeError) as e:
+        # Absence is handled in read_state, so this is a real I/O or git failure; abort rather than treat it as a deletion.
         print(f"error: sync aborted: {e}", file=sys.stderr)
         return 1
 

@@ -1,0 +1,1 @@
+../../shared/.claude/commands/aky-rule-update-suggestion.md

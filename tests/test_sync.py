@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_PATH = os.path.join(REPO_ROOT, "scripts", "sync.py")
@@ -1167,6 +1168,30 @@ class ForceFlagsTests(SyncTestCase):
         self.assertEqual(self.read(tpl, "a.md"), "target customized")
         self.assertEqual(self.read(self.target_root, "a.md"), "target customized")
 
+    def test_force_template_replaces_settings_json_whole(self):
+        tpl = self.make_template("tpl")
+        self.write(tpl, "settings.json", json.dumps({"a": 1, "b": 1}))
+        self.add_target("tpl")
+        self.run_cli("sync", "1")
+
+        self.write(self.target_root, "settings.json", json.dumps({"a": 1, "b": 2, "own": 1}))
+        code, out = self.run_cli("sync", "1", "--force-template")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.read(tpl, "settings.json")), {"a": 1, "b": 1})
+        self.assertEqual(json.loads(self.read(self.target_root, "settings.json")), {"a": 1, "b": 1})
+
+    def test_force_target_replaces_settings_json_whole(self):
+        tpl = self.make_template("tpl")
+        self.write(tpl, "settings.json", json.dumps({"a": 1, "b": 1}))
+        self.add_target("tpl")
+        self.run_cli("sync", "1")
+
+        self.write(tpl, "settings.json", json.dumps({"a": 1, "b": 2, "new": 1}))
+        code, out = self.run_cli("sync", "1", "--force-target")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.read(tpl, "settings.json")), {"a": 1, "b": 1})
+        self.assertEqual(json.loads(self.read(self.target_root, "settings.json")), {"a": 1, "b": 1})
+
     def test_force_flags_are_mutually_exclusive(self):
         tpl = self.make_template("tpl")
         self.add_target("tpl")
@@ -1205,8 +1230,32 @@ class InteractiveSyncTests(SyncTestCase):
         self.assertRegex(out, r"template → repo\s+a\.md")
 
 
+class GitFailureTests(SyncTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        tpl = self.make_template("tpl")
+        self.write(tpl, "a.md", "v1")
+        self.add_target("tpl")
+
+        def failing_check_ignore(*_args):
+            raise RuntimeError("git check-ignore failed: boom")
+
+        self.module.gitignored_relpaths = failing_check_ignore
+
+    def test_sync_reports_git_failure_as_error(self):
+        code, out = self.run_cli("sync", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("error: sync aborted: git check-ignore failed: boom", out)
+        self.assertFalse(self.exists(self.target_root, "a.md"))
+
+    def test_status_reports_git_failure_per_repo(self):
+        code, out = self.run_cli("status")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"\(tpl\): error: git check-ignore failed: boom")
+
+
 class UnattendedHoldTests(SyncTestCase):
-    """Non-interactive stdin must not auto-confirm held items. These cases need the real wait_for_enter/isatty, so they bypass setUp's fakes: a separate clean module with only open_editor replaced and sys.stdin faked as non-tty."""
+    """Non-interactive stdin must not auto-confirm held items. These cases need the real wait_for_enter/isatty, so they bypass setUp's fakes: a separate clean module with sys.stdin faked as non-tty."""
 
     def _run_fresh(self, argv):
         fresh = load_fresh_module()
@@ -1219,7 +1268,6 @@ class UnattendedHoldTests(SyncTestCase):
         fresh.BACKUP_ROOT = self.module.BACKUP_ROOT
         fresh.USER_TEMPLATE_ROOT = self.module.USER_TEMPLATE_ROOT
         fresh.USER_TARGET_ROOT = self.module.USER_TARGET_ROOT
-        fresh.open_editor = lambda paths: None
 
         class FakeStdin:
             def isatty(self):
@@ -1268,6 +1316,21 @@ class UnattendedHoldTests(SyncTestCase):
         self.assertNotIn("Revert anything", out)
         ts = self.module.read_state(self.module.snapshot_dir("1", "template"), "a.md")
         self.assertEqual(ts[0], b"v1")
+
+    def test_non_tty_does_not_launch_editor(self):
+        tpl = self.make_template("tpl")
+        self.write(tpl, "a.md", "v1")
+        self.add_target("tpl")
+        self.run_cli("sync", "1")
+
+        self.write(tpl, "a.md", "template side")
+        self.write(self.target_root, "a.md", "target side")
+        # A nonexistent editor makes any launch attempt show up in the output instead of opening something.
+        with mock.patch.dict(os.environ, {"EDITOR": os.path.join(self.workdir, "no-such-editor")}):
+            code, out = self._run_fresh(["sync", "1"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("Couldn't start $EDITOR", out)
+        self.assertNotIn("$EDITOR is not set", out)
 
     def test_non_tty_with_absent_side_pending_exits_nonzero(self):
         tpl = self.make_template("tpl")

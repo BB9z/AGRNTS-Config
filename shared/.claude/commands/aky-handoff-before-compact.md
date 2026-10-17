@@ -1,0 +1,1 @@
+Context is about to be compacted. Create/update *.handoff.md doc at the repo root, omitting project conventions.

@@ -1,15 +1,1 @@
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node scripts/agents/post-edit-gate.mjs"
-          }
-        ]
-      }
-    ]
-  }
-}
+../../../shared/.claude/settings.json

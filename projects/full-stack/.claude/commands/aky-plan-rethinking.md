@@ -1,1 +1,1 @@
-Rethink the approach. Identify potential issues and propose a more concise, streamlined implementation.
+../../../../shared/.claude/commands/aky-plan-rethinking.md

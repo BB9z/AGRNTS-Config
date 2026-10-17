@@ -1,0 +1,1 @@
+../../shared/.claude/commands/aky-coding-post-simplify.md

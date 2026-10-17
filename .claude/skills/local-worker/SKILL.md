@@ -1,0 +1,1 @@
+../../../shared/.claude/skills/local-worker/SKILL.md

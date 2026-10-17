@@ -1,0 +1,1 @@
+../../../../shared/.claude/skills/aky-review-staged-commit/scripts/review_diff.py

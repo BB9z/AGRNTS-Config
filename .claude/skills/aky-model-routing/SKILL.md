@@ -1,0 +1,1 @@
+../../../shared/.claude/skills/aky-model-routing/SKILL.md
