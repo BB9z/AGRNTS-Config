@@ -6,7 +6,7 @@
 
 - `user/claude/` → `~/.claude/`
 - `projects/<模板>/` → 目标仓
-- `shared/` 项目模板之间共用的文件，模板里用符号链接引用
+- `shared/` 项目模板之间共用的文件，模板里用符号链接引用；`scripts/link_shared.py` 把模板里与 shared 一致的实体文件换成链接
 
 ## 同步工具用法
 

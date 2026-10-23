@@ -30,9 +30,9 @@ USER_TEMPLATE_ROOT = os.path.join(REPO_ROOT, "user", "claude")
 USER_TARGET_ROOT = os.path.expanduser("~/.claude")
 USER_SHORT_ID = "user"
 
-# Importable whether this file is run directly or loaded by path.
+# Lets `lib` import whether this file is run directly or loaded by path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sync_settings as jsonmerge  # noqa: E402
+from lib import settings_merge  # noqa: E402
 
 # Machine-local, so never synced.
 EXCLUDE_RELPATHS = frozenset({".claude/settings.local.json"})
@@ -529,8 +529,8 @@ def is_customized(relpath: str, ts, ls) -> bool:
     ts_obj, ls_obj = _load_json_side(ts), _load_json_side(ls)
     if _SETTINGS_INVALID in (ts_obj, ls_obj):
         return True
-    ls_leaves = jsonmerge.flatten(ls_obj)
-    return any(ls_leaves.get(path, _ABSENT) != value for path, value in jsonmerge.flatten(ts_obj).items())
+    ls_leaves = settings_merge.flatten(ls_obj)
+    return any(ls_leaves.get(path, _ABSENT) != value for path, value in settings_merge.flatten(ts_obj).items())
 
 
 def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dict):
@@ -547,10 +547,10 @@ def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dic
     if _SETTINGS_INVALID in (t_obj, l_obj, ts_obj, ls_obj):
         return "settings_invalid_json", False, [template_path, target_path]
 
-    t_leaves = jsonmerge.flatten(t_obj)
-    l_leaves = jsonmerge.flatten(l_obj)
-    ts_leaves = jsonmerge.flatten(ts_obj)
-    ls_leaves = jsonmerge.flatten(ls_obj)
+    t_leaves = settings_merge.flatten(t_obj)
+    l_leaves = settings_merge.flatten(l_obj)
+    ts_leaves = settings_merge.flatten(ts_obj)
+    ls_leaves = settings_merge.flatten(ls_obj)
 
     has_snapshot = ts is not None or ls is not None
     universe = set(t_leaves) | set(ts_leaves)
@@ -575,7 +575,7 @@ def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dic
         elif outcome == "delete_template":
             template_leaves.pop(path, None)
         else:  # needs_merge
-            new_target, new_template, conflicted = jsonmerge.resolve_leaf_conflict(tv, lv, tsv, lsv)
+            new_target, new_template, conflicted = settings_merge.resolve_leaf_conflict(tv, lv, tsv, lsv)
             if new_target is None:
                 target_leaves.pop(path, None)
             else:
@@ -587,8 +587,8 @@ def apply_settings_merge(batch_dir, short_id, template_root, target_root, a: dic
             if conflicted:
                 conflicted_paths.append(path)
 
-    new_target_obj = jsonmerge.rebuild_object(l_obj, target_leaves)
-    new_template_obj = jsonmerge.rebuild_object(t_obj, template_leaves)
+    new_target_obj = settings_merge.rebuild_object(l_obj, target_leaves)
+    new_template_obj = settings_merge.rebuild_object(t_obj, template_leaves)
     new_target_bytes = (json.dumps(new_target_obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     new_template_bytes = (json.dumps(new_template_obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
